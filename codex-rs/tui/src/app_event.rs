@@ -817,6 +817,11 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
+    /// Submit a plain text user message from the local remote-control page.
+    SubmitRemoteControlUserMessage {
+        text: String,
+    },
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

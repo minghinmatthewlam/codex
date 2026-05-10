@@ -344,6 +344,7 @@ use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod realtime;
 use self::realtime::RealtimeConversationUiState;
 mod reasoning_shortcuts;
+mod remote_control;
 mod side;
 mod status_surfaces;
 use self::status_surfaces::CachedProjectRootName;
