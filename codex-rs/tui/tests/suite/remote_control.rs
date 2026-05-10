@@ -40,6 +40,88 @@ async fn remote_control_slash_command_starts_sidecar() -> anyhow::Result<()> {
     .await
 }
 
+#[tokio::test]
+async fn remote_control_slash_command_stops_sidecar() -> anyhow::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let args = vec!["-c".to_string(), "analytics.enabled=false".to_string()];
+    let spawned_tui = spawn_remote_control_tui(&args).await?;
+    let codex_utils_pty::SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned_tui.spawned;
+    let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
+    let mut exit_rx = exit_rx;
+    let writer_tx = session.writer_sender();
+    let url_regex =
+        Regex::new(r"http://(?:127\.0\.0\.1|\d+\.\d+\.\d+\.\d+):\d+\?token=[A-Za-z0-9_-]+")?;
+    let mut output = Vec::new();
+    let mut start_sent = false;
+    let mut stop_sent = false;
+    let mut control_url = None;
+
+    let proof = timeout(Duration::from_secs(20), async {
+        loop {
+            select! {
+                result = output_rx.recv() => match result {
+                    Ok(chunk) => {
+                        if chunk.windows(4).any(|window| window == b"\x1b[6n") {
+                            let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
+                        }
+                        output.extend_from_slice(&chunk);
+                        let visible_output = String::from_utf8_lossy(&output);
+                        if !start_sent && visible_output.contains("gpt-5.5 default") {
+                            let _ = writer_tx.send(b"/remote-control".to_vec()).await;
+                            sleep(Duration::from_millis(100)).await;
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            start_sent = true;
+                        }
+                        if start_sent
+                            && !stop_sent
+                            && let Some(found) = url_regex.find(&visible_output)
+                        {
+                            control_url = Some(found.as_str().to_string());
+                            let _ = writer_tx.send(b"/remote-control stop".to_vec()).await;
+                            sleep(Duration::from_millis(100)).await;
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            stop_sent = true;
+                        }
+                        if stop_sent && visible_output.contains("Remote control stopped.") {
+                            let control_url = control_url
+                                .as_deref()
+                                .context("remote-control URL should be captured before stop")?;
+                            wait_for_remote_control_server_to_stop(control_url).await?;
+                            return Ok(());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("codex output closed before remote-control stopped: {}", output_tail(&output));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                },
+                result = &mut exit_rx => {
+                    let exit_code = result.context("codex exit channel closed")?;
+                    anyhow::bail!("codex exited with {exit_code} before remote-control stopped: {}", output_tail(&output));
+                }
+            }
+        }
+    })
+    .await;
+
+    session.terminate();
+    match proof {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "timed out waiting for remote-control stop in normal Codex TUI: {}",
+            output_tail(&output)
+        ),
+    }
+}
+
 enum RemoteControlStart {
     CommandLineFlag,
     SlashCommand,
@@ -54,28 +136,13 @@ async fn run_remote_control_tui_smoke(
         return Ok(());
     }
 
-    let tmp = tempfile::tempdir()?;
-    let codex_home = tmp.path();
-    let cwd = std::env::current_dir()?;
-    let config_contents = format!(
-        r#"
-model_provider = "ollama"
-
-[projects]
-"{cwd}" = {{ trust_level = "trusted" }}
-"#,
-        cwd = cwd.display()
-    );
-    std::fs::write(codex_home.join("config.toml"), config_contents)?;
-
-    let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
-    let spawned = spawn_codex_cli(&codex_cli, &args, codex_home, &cwd).await?;
+    let spawned_tui = spawn_remote_control_tui(&args).await?;
     let codex_utils_pty::SpawnedProcess {
         session,
         stdout_rx,
         stderr_rx,
         exit_rx,
-    } = spawned;
+    } = spawned_tui.spawned;
     let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
     let mut exit_rx = exit_rx;
     let writer_tx = session.writer_sender();
@@ -135,6 +202,34 @@ model_provider = "ollama"
     }
 }
 
+struct SpawnedRemoteControlTui {
+    _codex_home: tempfile::TempDir,
+    spawned: codex_utils_pty::SpawnedProcess,
+}
+
+async fn spawn_remote_control_tui(args: &[String]) -> anyhow::Result<SpawnedRemoteControlTui> {
+    let tmp = tempfile::tempdir()?;
+    let codex_home = tmp.path();
+    let cwd = std::env::current_dir()?;
+    let config_contents = format!(
+        r#"
+model_provider = "ollama"
+
+[projects]
+"{cwd}" = {{ trust_level = "trusted" }}
+"#,
+        cwd = cwd.display()
+    );
+    std::fs::write(codex_home.join("config.toml"), config_contents)?;
+
+    let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let spawned = spawn_codex_cli(&codex_cli, args, codex_home, &cwd).await?;
+    Ok(SpawnedRemoteControlTui {
+        _codex_home: tmp,
+        spawned,
+    })
+}
+
 async fn spawn_codex_cli(
     codex_cli: &Path,
     args: &[String],
@@ -191,6 +286,25 @@ fn post_remote_control_message(control_url: &str, prompt: &str) -> anyhow::Resul
     } else {
         anyhow::bail!("unexpected remote-control response: {response}");
     }
+}
+
+async fn wait_for_remote_control_server_to_stop(control_url: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(control_url).context("remote-control URL should parse")?;
+    let port = url
+        .port()
+        .context("remote-control URL should include port")?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..40 {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            Ok(stream) => {
+                drop(stream);
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+
+    anyhow::bail!("remote-control server still accepts connections after /remote-control stop")
 }
 
 fn output_tail(output: &[u8]) -> String {
