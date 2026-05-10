@@ -9,10 +9,47 @@ use std::time::Duration;
 use anyhow::Context;
 use regex_lite::Regex;
 use tokio::select;
+use tokio::time::sleep;
 use tokio::time::timeout;
 
 #[tokio::test]
 async fn remote_control_posts_into_normal_codex_tui() -> anyhow::Result<()> {
+    let args = vec![
+        "-c".to_string(),
+        "analytics.enabled=false".to_string(),
+        "--remote-control".to_string(),
+        "--remote-control-bind".to_string(),
+        "127.0.0.1:0".to_string(),
+    ];
+    run_remote_control_tui_smoke(
+        args,
+        RemoteControlStart::CommandLineFlag,
+        "remote control smoke test prompt",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn remote_control_slash_command_starts_sidecar() -> anyhow::Result<()> {
+    let args = vec!["-c".to_string(), "analytics.enabled=false".to_string()];
+    run_remote_control_tui_smoke(
+        args,
+        RemoteControlStart::SlashCommand,
+        "remote control slash smoke test prompt",
+    )
+    .await
+}
+
+enum RemoteControlStart {
+    CommandLineFlag,
+    SlashCommand,
+}
+
+async fn run_remote_control_tui_smoke(
+    args: Vec<String>,
+    start: RemoteControlStart,
+    prompt: &str,
+) -> anyhow::Result<()> {
     if cfg!(windows) {
         return Ok(());
     }
@@ -31,15 +68,7 @@ model_provider = "ollama"
     );
     std::fs::write(codex_home.join("config.toml"), config_contents)?;
 
-    let prompt = "remote control smoke test prompt";
     let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
-    let args = vec![
-        "-c".to_string(),
-        "analytics.enabled=false".to_string(),
-        "--remote-control".to_string(),
-        "--remote-control-bind".to_string(),
-        "127.0.0.1:0".to_string(),
-    ];
     let spawned = spawn_codex_cli(&codex_cli, &args, codex_home, &cwd).await?;
     let codex_utils_pty::SpawnedProcess {
         session,
@@ -50,9 +79,11 @@ model_provider = "ollama"
     let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
     let mut exit_rx = exit_rx;
     let writer_tx = session.writer_sender();
-    let url_regex = Regex::new(r"http://127\.0\.0\.1:\d+\?token=[A-Za-z0-9_-]+")?;
+    let url_regex =
+        Regex::new(r"http://(?:127\.0\.0\.1|\d+\.\d+\.\d+\.\d+):\d+\?token=[A-Za-z0-9_-]+")?;
     let mut output = Vec::new();
     let mut posted = false;
+    let mut slash_command_sent = matches!(start, RemoteControlStart::CommandLineFlag);
 
     let proof = timeout(Duration::from_secs(20), async {
         loop {
@@ -64,6 +95,12 @@ model_provider = "ollama"
                         }
                         output.extend_from_slice(&chunk);
                         let visible_output = String::from_utf8_lossy(&output);
+                        if !slash_command_sent && visible_output.contains("gpt-5.5 default") {
+                            let _ = writer_tx.send(b"/remote-control".to_vec()).await;
+                            sleep(Duration::from_millis(100)).await;
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            slash_command_sent = true;
+                        }
                         if !posted
                             && let Some(found) = url_regex.find(&visible_output)
                         {
