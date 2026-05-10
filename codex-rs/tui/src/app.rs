@@ -192,6 +192,7 @@ mod input;
 mod loaded_threads;
 mod pending_interactive_replay;
 mod platform_actions;
+mod remote_control;
 mod replay_filter;
 mod resize_reflow;
 mod session_lifecycle;
@@ -477,6 +478,8 @@ pub(crate) struct App {
     environment_manager: Arc<EnvironmentManager>,
     remote_app_server_url: Option<String>,
     remote_app_server_auth_token: Option<String>,
+    local_remote_control_options: crate::remote_control::LocalRemoteControlOptions,
+    local_remote_control_server: Option<crate::remote_control::LocalRemoteControlServer>,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
 
@@ -861,6 +864,7 @@ See the Codex keymap documentation for supported actions and examples."
         })?;
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
+        let startup_local_remote_control = local_remote_control.clone();
 
         let mut app = Self {
             model_catalog,
@@ -894,6 +898,8 @@ See the Codex keymap documentation for supported actions and examples."
             environment_manager,
             remote_app_server_url,
             remote_app_server_auth_token,
+            local_remote_control_options: local_remote_control.unwrap_or_default(),
+            local_remote_control_server: None,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
@@ -920,27 +926,9 @@ See the Codex keymap documentation for supported actions and examples."
                     .await;
             }
         }
-        let _remote_control_server = match local_remote_control {
-            Some(options) => {
-                match crate::remote_control::start_local_server(options, app.app_event_tx.clone()) {
-                    Ok(server) => {
-                        app.chat_widget.add_info_message(
-                        format!("Remote control: {}", server.url()),
-                        Some(
-                            "Open this URL on your phone. Anyone with the URL can submit prompts to this Codex session.".to_string(),
-                        ),
-                    );
-                        Some(server)
-                    }
-                    Err(err) => {
-                        app.chat_widget
-                            .add_error_message(format!("Remote control failed to start: {err}"));
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
+        if let Some(options) = startup_local_remote_control {
+            app.start_local_remote_control(options);
+        }
 
         // On startup, if a managed filesystem sandbox is active, warn about
         // world-writable dirs on Windows.
@@ -1065,6 +1053,7 @@ See the Codex keymap documentation for supported actions and examples."
                 ) {
                     waiting_for_initial_session_configured = false;
                 }
+                app.sync_remote_control_snapshot();
                 match control {
                     AppRunControl::Continue => {}
                     AppRunControl::Exit(reason) => break Ok(reason),

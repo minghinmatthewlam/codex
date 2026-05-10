@@ -375,6 +375,9 @@ impl ChatWidget {
                     );
                 }
             }
+            SlashCommand::RemoteControl => {
+                self.app_event_tx.send(AppEvent::StartRemoteControl);
+            }
             SlashCommand::Ide => {
                 self.handle_ide_command();
             }
@@ -599,6 +602,11 @@ impl ChatWidget {
             SlashCommand::Mcp => match trimmed.to_ascii_lowercase().as_str() {
                 "verbose" => self.add_mcp_output(McpServerStatusDetail::Full),
                 _ => self.add_error_message("Usage: /mcp [verbose]".to_string()),
+            },
+            SlashCommand::RemoteControl => match trimmed.to_ascii_lowercase().as_str() {
+                "start" => self.app_event_tx.send(AppEvent::StartRemoteControl),
+                "stop" => self.app_event_tx.send(AppEvent::StopRemoteControl),
+                _ => self.add_error_message("Usage: /remote-control [start|stop]".to_string()),
             },
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
@@ -898,6 +906,7 @@ impl ChatWidget {
             SlashCommand::Fast
             | SlashCommand::Ide
             | SlashCommand::Status
+            | SlashCommand::RemoteControl
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop

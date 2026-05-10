@@ -1769,6 +1769,12 @@ impl App {
             AppEvent::SubmitRemoteControlUserMessage { text } => {
                 self.chat_widget.submit_remote_control_user_message(text);
             }
+            AppEvent::StartRemoteControl => {
+                self.start_local_remote_control(self.local_remote_control_options.clone());
+            }
+            AppEvent::StopRemoteControl => {
+                self.stop_local_remote_control();
+            }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();
             }

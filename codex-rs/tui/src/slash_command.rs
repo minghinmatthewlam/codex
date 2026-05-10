@@ -45,6 +45,7 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    RemoteControl,
     DebugConfig,
     Title,
     Statusline,
@@ -95,6 +96,7 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::RemoteControl => "start or stop phone remote control for this session",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Title => "configure which items appear in the terminal title",
             SlashCommand::Statusline => "configure which items appear in the status line",
@@ -155,6 +157,7 @@ impl SlashCommand {
                 | SlashCommand::Ide
                 | SlashCommand::Keymap
                 | SlashCommand::Mcp
+                | SlashCommand::RemoteControl
                 | SlashCommand::Raw
                 | SlashCommand::Side
                 | SlashCommand::Resume
@@ -207,6 +210,7 @@ impl SlashCommand {
             | SlashCommand::Skills
             | SlashCommand::Hooks
             | SlashCommand::Status
+            | SlashCommand::RemoteControl
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
@@ -273,9 +277,20 @@ mod tests {
         assert!(SlashCommand::Ide.available_during_task());
         assert!(SlashCommand::Title.available_during_task());
         assert!(SlashCommand::Statusline.available_during_task());
+        assert!(SlashCommand::RemoteControl.available_during_task());
+        assert!(SlashCommand::RemoteControl.supports_inline_args());
         assert!(SlashCommand::Raw.available_during_task());
         assert!(SlashCommand::Raw.available_in_side_conversation());
         assert!(SlashCommand::Raw.supports_inline_args());
+    }
+
+    #[test]
+    fn remote_control_command_is_kebab_case() {
+        assert_eq!(SlashCommand::RemoteControl.command(), "remote-control");
+        assert_eq!(
+            SlashCommand::from_str("remote-control"),
+            Ok(SlashCommand::RemoteControl)
+        );
     }
 
     #[test]

@@ -822,6 +822,12 @@ pub(crate) enum AppEvent {
         text: String,
     },
 
+    /// Start or re-show local remote-control pairing for the running TUI session.
+    StartRemoteControl,
+
+    /// Stop local remote-control pairing for the running TUI session.
+    StopRemoteControl,
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 
