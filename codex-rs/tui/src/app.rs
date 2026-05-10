@@ -615,6 +615,7 @@ impl App {
         should_prompt_windows_sandbox_nux_at_startup: bool,
         remote_app_server_url: Option<String>,
         remote_app_server_auth_token: Option<String>,
+        local_remote_control: Option<crate::remote_control::LocalRemoteControlOptions>,
         state_db: Option<StateDbHandle>,
         environment_manager: Arc<EnvironmentManager>,
     ) -> Result<AppExitInfo> {
@@ -919,6 +920,27 @@ See the Codex keymap documentation for supported actions and examples."
                     .await;
             }
         }
+        let _remote_control_server = match local_remote_control {
+            Some(options) => {
+                match crate::remote_control::start_local_server(options, app.app_event_tx.clone()) {
+                    Ok(server) => {
+                        app.chat_widget.add_info_message(
+                        format!("Remote control: {}", server.url()),
+                        Some(
+                            "Open this URL on your phone. Anyone with the URL can submit prompts to this Codex session.".to_string(),
+                        ),
+                    );
+                        Some(server)
+                    }
+                    Err(err) => {
+                        app.chat_widget
+                            .add_error_message(format!("Remote control failed to start: {err}"));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
 
         // On startup, if a managed filesystem sandbox is active, warn about
         // world-writable dirs on Windows.

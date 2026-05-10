@@ -681,6 +681,14 @@ struct InteractiveRemoteOptions {
     /// a remote app server websocket.
     #[arg(long = "remote-auth-token-env", value_name = "ENV_VAR")]
     remote_auth_token_env: Option<String>,
+
+    /// Start the normal interactive TUI with a local phone remote-control page.
+    #[arg(long = "remote-control", default_value_t = false)]
+    remote_control: bool,
+
+    /// Address for the local remote-control phone page.
+    #[arg(long = "remote-control-bind", value_name = "ADDR")]
+    remote_control_bind: Option<String>,
 }
 
 impl FeatureToggles {
@@ -765,8 +773,18 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
-    let root_remote = remote.remote;
-    let root_remote_auth_token_env = remote.remote_auth_token_env;
+    let root_remote_options = remote;
+    let root_remote = root_remote_options.remote.clone();
+    let root_remote_auth_token_env = root_remote_options.remote_auth_token_env.clone();
+    let root_local_remote_control = local_remote_control_options(&root_remote_options)?;
+    if root_local_remote_control.is_some()
+        && !matches!(
+            &subcommand,
+            None | Some(Subcommand::Resume(_)) | Some(Subcommand::Fork(_))
+        )
+    {
+        anyhow::bail!("`--remote-control` is only supported for interactive TUI commands");
+    }
 
     match subcommand {
         None => {
@@ -778,6 +796,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 interactive,
                 root_remote.clone(),
                 root_remote_auth_token_env.clone(),
+                root_local_remote_control.clone(),
                 arg0_paths.clone(),
             )
             .await?;
@@ -951,12 +970,15 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 include_non_interactive,
                 config_overrides,
             );
+            let local_remote_control =
+                local_remote_control_options(&remote)?.or(root_local_remote_control.clone());
             let exit_info = run_interactive_tui(
                 interactive,
                 remote.remote.or(root_remote.clone()),
                 remote
                     .remote_auth_token_env
                     .or(root_remote_auth_token_env.clone()),
+                local_remote_control,
                 arg0_paths.clone(),
             )
             .await?;
@@ -977,12 +999,15 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 all,
                 config_overrides,
             );
+            let local_remote_control =
+                local_remote_control_options(&remote)?.or(root_local_remote_control.clone());
             let exit_info = run_interactive_tui(
                 interactive,
                 remote.remote.or(root_remote.clone()),
                 remote
                     .remote_auth_token_env
                     .or(root_remote_auth_token_env.clone()),
+                local_remote_control,
                 arg0_paths.clone(),
             )
             .await?;
@@ -1581,6 +1606,7 @@ async fn run_interactive_tui(
     mut interactive: TuiCli,
     remote: Option<String>,
     remote_auth_token_env: Option<String>,
+    local_remote_control: Option<codex_tui::LocalRemoteControlOptions>,
     arg0_paths: Arg0DispatchPaths,
 ) -> std::io::Result<AppExitInfo> {
     if let Some(prompt) = interactive.prompt.take() {
@@ -1627,8 +1653,28 @@ async fn run_interactive_tui(
         codex_config::LoaderOverrides::default(),
         normalized_remote,
         remote_auth_token,
+        local_remote_control,
     )
     .await
+}
+
+fn local_remote_control_options(
+    remote_options: &InteractiveRemoteOptions,
+) -> anyhow::Result<Option<codex_tui::LocalRemoteControlOptions>> {
+    if !remote_options.remote_control {
+        if remote_options.remote_control_bind.is_some() {
+            anyhow::bail!("`--remote-control-bind` requires `--remote-control`");
+        }
+        return Ok(None);
+    }
+
+    let bind_addr = remote_options
+        .remote_control_bind
+        .as_deref()
+        .unwrap_or("0.0.0.0:0")
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid `--remote-control-bind` address: {err}"))?;
+    Ok(Some(codex_tui::LocalRemoteControlOptions { bind_addr }))
 }
 
 fn confirm(prompt: &str) -> std::io::Result<bool> {
@@ -2349,6 +2395,34 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(["codex", "--remote", "ws://127.0.0.1:4500"])
             .expect("parse");
         assert_eq!(cli.remote.remote.as_deref(), Some("ws://127.0.0.1:4500"));
+    }
+
+    #[test]
+    fn remote_control_flag_parses_for_interactive_root() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "--remote-control",
+            "--remote-control-bind",
+            "127.0.0.1:0",
+        ])
+        .expect("parse");
+        let options =
+            local_remote_control_options(&cli.remote).expect("remote control options should parse");
+        assert_eq!(
+            options,
+            Some(codex_tui::LocalRemoteControlOptions {
+                bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+            })
+        );
+    }
+
+    #[test]
+    fn remote_control_bind_requires_remote_control() {
+        let cli = MultitoolCli::try_parse_from(["codex", "--remote-control-bind", "127.0.0.1:0"])
+            .expect("parse");
+        let err = local_remote_control_options(&cli.remote)
+            .expect_err("bind should require --remote-control");
+        assert!(err.to_string().contains("--remote-control"));
     }
 
     #[test]

@@ -59,6 +59,7 @@ use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
 use color_eyre::eyre::WrapErr;
 use cwd_prompt::CwdPromptAction;
+pub use remote_control::LocalRemoteControlOptions;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
@@ -702,6 +703,7 @@ pub async fn run_main(
     loader_overrides: LoaderOverrides,
     remote: Option<String>,
     remote_auth_token: Option<String>,
+    local_remote_control: Option<LocalRemoteControlOptions>,
 ) -> std::io::Result<AppExitInfo> {
     let remote_url = remote;
     if let (Some(websocket_url), Some(_)) = (remote_url.as_deref(), remote_auth_token.as_ref()) {
@@ -1077,6 +1079,7 @@ pub async fn run_main(
         state_db,
         remote_url,
         remote_auth_token,
+        local_remote_control,
         environment_manager,
     )
     .await
@@ -1099,6 +1102,7 @@ async fn run_ratatui_app(
     state_db: Option<StateDbHandle>,
     remote_url: Option<String>,
     remote_auth_token: Option<String>,
+    local_remote_control: Option<LocalRemoteControlOptions>,
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppExitInfo> {
     let remote_mode = matches!(&app_server_target, AppServerTarget::Remote { .. });
@@ -1526,6 +1530,7 @@ async fn run_ratatui_app(
         should_prompt_windows_sandbox_nux_at_startup,
         remote_url,
         remote_auth_token,
+        local_remote_control,
         state_db,
         environment_manager,
     )
