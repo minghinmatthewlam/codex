@@ -297,6 +297,7 @@ fn serve(
                 let shared_state = shared_state.clone();
                 let shutdown = Arc::clone(&shutdown);
                 thread::spawn(move || {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(DEFAULT_RESPONSE_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(DEFAULT_RESPONSE_TIMEOUT));
                     if let Err(err) = handle_connection(
@@ -863,9 +864,13 @@ mod tests {
         let thread_id = "00000000-0000-4000-8000-000000000123";
         let rollout_file_name = format!("rollout-2026-05-11T00-00-00-{thread_id}.jsonl");
         let rollout_path = temp.path().join(&rollout_file_name);
+        let rollout_tail = "large rollout tail marker";
         fs::write(
             &rollout_path,
-            format!(r#"{{"type":"session_meta","payload":{{"id":"{thread_id}"}}}}"#),
+            format!(
+                "{}\n{rollout_tail}\n",
+                r#"{"type":"message","payload":"large remote fork transcript"}"#.repeat(16_384)
+            ),
         )
         .expect("write rollout file");
         let (tx, _rx) = unbounded_channel();
@@ -937,6 +942,10 @@ mod tests {
         assert!(
             response.contains(&format!(r#""rolloutFileName":"{rollout_file_name}""#)),
             "unexpected response: {response}"
+        );
+        assert!(
+            response.contains(rollout_tail),
+            "response should include the full rollout bundle"
         );
     }
 
