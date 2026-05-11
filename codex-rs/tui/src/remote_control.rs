@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::io::Read;
 use std::io::Write;
@@ -7,6 +8,7 @@ use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::net::UdpSocket;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -48,6 +50,9 @@ pub(crate) struct RemoteControlSnapshot {
     pub(crate) cwd: String,
     pub(crate) status: String,
     pub(crate) messages: Vec<RemoteControlTranscriptItem>,
+    pub(crate) fork: RemoteControlForkStatus,
+    #[serde(skip)]
+    pub(crate) fork_source: Option<RemoteControlForkSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -66,27 +71,68 @@ pub(crate) enum RemoteControlTranscriptRole {
     Status,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteControlForkStatus {
+    pub(crate) available: bool,
+    pub(crate) thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteControlForkSource {
+    pub(crate) thread_id: String,
+    pub(crate) cwd: String,
+    pub(crate) rollout_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteForkBundle {
+    protocol_version: u8,
+    thread_id: String,
+    cwd: String,
+    rollout_file_name: String,
+    rollout_jsonl: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkPostResponse {
+    ok: bool,
+    code: String,
+    command: String,
+}
+
 #[derive(Clone)]
 struct RemoteControlSharedState {
     snapshot: Arc<Mutex<RemoteControlSnapshot>>,
+    fork_source: Arc<Mutex<Option<RemoteControlForkSource>>>,
+    forks: Arc<Mutex<HashMap<String, RemoteForkBundle>>>,
     subscribers: Arc<Mutex<Vec<mpsc::Sender<String>>>>,
 }
 
 impl RemoteControlSharedState {
     fn new(snapshot: RemoteControlSnapshot) -> Self {
+        let fork_source = snapshot.fork_source.clone();
         Self {
             snapshot: Arc::new(Mutex::new(snapshot)),
+            fork_source: Arc::new(Mutex::new(fork_source)),
+            forks: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn update_snapshot(&self, snapshot: RemoteControlSnapshot) {
+        let fork_source = snapshot.fork_source.clone();
         let payload = serde_json::to_string(&snapshot).unwrap_or_else(|err| {
             tracing::warn!("failed to serialize remote-control snapshot: {err}");
             "{}".to_string()
         });
         if let Ok(mut current) = self.snapshot.lock() {
             *current = snapshot;
+        }
+        if let Ok(mut current) = self.fork_source.lock() {
+            *current = fork_source;
         }
         if let Ok(mut subscribers) = self.subscribers.lock() {
             subscribers.retain(|subscriber| subscriber.send(payload.clone()).is_ok());
@@ -107,6 +153,60 @@ impl RemoteControlSharedState {
             subscribers.push(tx);
         }
         rx
+    }
+
+    fn create_fork(&self, public_base_url: &str, token: &str) -> io::Result<ForkPostResponse> {
+        let source = self
+            .fork_source
+            .lock()
+            .ok()
+            .and_then(|source| source.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "No forkable Codex session is available yet.",
+                )
+            })?;
+        let rollout_file_name = source
+            .rollout_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "rollout path `{}` has no UTF-8 file name",
+                        source.rollout_path.display()
+                    ),
+                )
+            })?
+            .to_string();
+        let rollout_jsonl = std::fs::read_to_string(&source.rollout_path)?;
+        let code = generate_fork_code();
+        let bundle = RemoteForkBundle {
+            protocol_version: 1,
+            thread_id: source.thread_id,
+            cwd: source.cwd,
+            rollout_file_name,
+            rollout_jsonl,
+        };
+        if let Ok(mut forks) = self.forks.lock() {
+            forks.insert(code.clone(), bundle);
+        }
+        let claim_url = format!("{public_base_url}/api/forks/{code}?token={token}");
+        Ok(ForkPostResponse {
+            ok: true,
+            code,
+            command: format!("codex remote-fork {claim_url}"),
+        })
+    }
+
+    fn fork_bundle_json(&self, code: &str) -> Option<String> {
+        self.forks
+            .lock()
+            .ok()
+            .and_then(|forks| forks.get(code).cloned())
+            .and_then(|bundle| serde_json::to_string(&bundle).ok())
     }
 }
 
@@ -151,17 +251,20 @@ pub(crate) fn start_local_server(
     listener.set_nonblocking(true)?;
     let local_addr = listener.local_addr()?;
     let token = generate_token();
-    let url = control_url(local_addr, &token);
+    let public_base_url = control_base_url(local_addr);
+    let url = format!("{public_base_url}?token={token}");
     let shared_state = RemoteControlSharedState::new(initial_snapshot);
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_shared_state = shared_state.clone();
+    let thread_public_base_url = public_base_url.clone();
     let join_handle = thread::Builder::new()
         .name("codex-remote-control".to_string())
         .spawn(move || {
             serve(
                 listener,
                 token,
+                thread_public_base_url,
                 app_event_tx,
                 thread_shared_state,
                 thread_shutdown,
@@ -180,6 +283,7 @@ pub(crate) fn start_local_server(
 fn serve(
     listener: TcpListener,
     token: String,
+    public_base_url: String,
     app_event_tx: AppEventSender,
     shared_state: RemoteControlSharedState,
     shutdown: Arc<AtomicBool>,
@@ -188,6 +292,7 @@ fn serve(
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let token = token.clone();
+                let public_base_url = public_base_url.clone();
                 let app_event_tx = app_event_tx.clone();
                 let shared_state = shared_state.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -197,6 +302,7 @@ fn serve(
                     if let Err(err) = handle_connection(
                         &mut stream,
                         &token,
+                        &public_base_url,
                         &app_event_tx,
                         &shared_state,
                         &shutdown,
@@ -219,6 +325,7 @@ fn serve(
 fn handle_connection(
     stream: &mut TcpStream,
     token: &str,
+    public_base_url: &str,
     app_event_tx: &AppEventSender,
     shared_state: &RemoteControlSharedState,
     shutdown: &AtomicBool,
@@ -251,6 +358,10 @@ fn handle_connection(
         ),
         ("GET", "/api/events") => handle_event_stream(stream, shared_state, shutdown),
         ("POST", "/api/message") => handle_message_post(stream, request, app_event_tx),
+        ("POST", "/api/fork") => handle_fork_post(stream, shared_state, public_base_url, token),
+        ("GET", path) if path.starts_with("/api/forks/") => {
+            handle_fork_bundle_get(stream, shared_state, path)
+        }
         _ => write_response(
             stream,
             "404 Not Found",
@@ -289,6 +400,54 @@ fn handle_message_post(
 
     app_event_tx.send(AppEvent::SubmitRemoteControlUserMessage { text: message });
     write_response(stream, "202 Accepted", "application/json", r#"{"ok":true}"#)
+}
+
+fn handle_fork_post(
+    stream: &mut TcpStream,
+    shared_state: &RemoteControlSharedState,
+    public_base_url: &str,
+    token: &str,
+) -> io::Result<()> {
+    match shared_state.create_fork(public_base_url, token) {
+        Ok(response) => write_response(
+            stream,
+            "201 Created",
+            "application/json",
+            &serde_json::to_string(&response).unwrap_or_else(|err| {
+                tracing::warn!("failed to serialize remote fork response: {err}");
+                r#"{"ok":false}"#.to_string()
+            }),
+        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => write_response(
+            stream,
+            "409 Conflict",
+            "text/plain; charset=utf-8",
+            "No forkable Codex session is available yet.\n",
+        ),
+        Err(err) => write_response(
+            stream,
+            "500 Internal Server Error",
+            "text/plain; charset=utf-8",
+            &format!("Failed to create fork: {err}\n"),
+        ),
+    }
+}
+
+fn handle_fork_bundle_get(
+    stream: &mut TcpStream,
+    shared_state: &RemoteControlSharedState,
+    path: &str,
+) -> io::Result<()> {
+    let code = path.trim_start_matches("/api/forks/");
+    match shared_state.fork_bundle_json(code) {
+        Some(bundle_json) => write_response(stream, "200 OK", "application/json", &bundle_json),
+        None => write_response(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "Fork code not found\n",
+        ),
+    }
 }
 
 fn handle_event_stream(
@@ -481,7 +640,13 @@ fn generate_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn control_url(addr: SocketAddr, token: &str) -> String {
+fn generate_fork_code() -> String {
+    let mut bytes = [0u8; 12];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn control_base_url(addr: SocketAddr) -> String {
     let host = match addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {
             local_lan_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
@@ -491,7 +656,7 @@ fn control_url(addr: SocketAddr, token: &str) -> String {
         }
         ip => ip,
     };
-    format!("http://{}:{}?token={token}", format_host(host), addr.port())
+    format!("http://{}:{}", format_host(host), addr.port())
 }
 
 fn format_host(host: IpAddr) -> String {
@@ -514,6 +679,7 @@ fn remote_control_html(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Read;
     use std::io::Write;
     use std::net::SocketAddr;
@@ -525,6 +691,8 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::LocalRemoteControlOptions;
+    use super::RemoteControlForkSource;
+    use super::RemoteControlForkStatus;
     use super::RemoteControlSnapshot;
     use super::RemoteControlTranscriptItem;
     use super::RemoteControlTranscriptRole;
@@ -625,6 +793,8 @@ mod tests {
                     role: RemoteControlTranscriptRole::User,
                     text: "continue from phone".to_string(),
                 }],
+                fork: fork_unavailable(),
+                fork_source: None,
             },
         )
         .expect("server should start");
@@ -662,6 +832,8 @@ mod tests {
                 role: RemoteControlTranscriptRole::Assistant,
                 text: "latest assistant response".to_string(),
             }],
+            fork: fork_unavailable(),
+            fork_source: None,
         });
 
         let response = send_request(
@@ -683,6 +855,89 @@ mod tests {
         assert!(html.contains("new EventSource"));
         assert!(html.contains("Loading the Codex transcript"));
         assert!(html.contains("test-token"));
+    }
+
+    #[tokio::test]
+    async fn fork_endpoint_returns_claim_command_and_bundle() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let thread_id = "00000000-0000-4000-8000-000000000123";
+        let rollout_file_name = format!("rollout-2026-05-11T00-00-00-{thread_id}.jsonl");
+        let rollout_path = temp.path().join(&rollout_file_name);
+        fs::write(
+            &rollout_path,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{thread_id}"}}}}"#),
+        )
+        .expect("write rollout file");
+        let (tx, _rx) = unbounded_channel();
+        let server = start_local_server(
+            LocalRemoteControlOptions {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback addr"),
+            },
+            AppEventSender::new(tx),
+            RemoteControlSnapshot {
+                cwd: "/tmp/codex".to_string(),
+                status: "Connected to Codex".to_string(),
+                messages: Vec::new(),
+                fork: RemoteControlForkStatus {
+                    available: true,
+                    thread_id: Some(thread_id.to_string()),
+                },
+                fork_source: Some(RemoteControlForkSource {
+                    thread_id: thread_id.to_string(),
+                    cwd: "/tmp/codex".to_string(),
+                    rollout_path,
+                }),
+            },
+        )
+        .expect("server should start");
+        let url = url::Url::parse(server.url()).expect("server URL should parse");
+        let token = url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "token").then(|| value.into_owned()))
+            .expect("server URL should include token");
+        let addr: SocketAddr = format!(
+            "127.0.0.1:{}",
+            url.port().expect("server URL should include port")
+        )
+        .parse()
+        .expect("socket addr");
+        let response = send_request(
+            addr,
+            &format!(
+                "POST /api/fork?token={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 201 Created"),
+            "unexpected response: {response}"
+        );
+        let body = response_body(&response);
+        let value: serde_json::Value = serde_json::from_str(body).expect("fork response JSON");
+        let command = value["command"].as_str().expect("command string");
+        let claim_url = command
+            .strip_prefix("codex remote-fork ")
+            .expect("remote fork command should include claim URL");
+        let claim = url::Url::parse(claim_url).expect("claim URL should parse");
+        let response = send_request(
+            addr,
+            &format!(
+                "GET {}?{} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                claim.path(),
+                claim.query().expect("claim URL should include token")
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains(&format!(r#""threadId":"{thread_id}""#)),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains(&format!(r#""rolloutFileName":"{rollout_file_name}""#)),
+            "unexpected response: {response}"
+        );
     }
 
     #[tokio::test]
@@ -734,6 +989,8 @@ mod tests {
                 role: RemoteControlTranscriptRole::Assistant,
                 text: "streamed transcript update".to_string(),
             }],
+            fork: fork_unavailable(),
+            fork_source: None,
         });
         let update = read_until_contains(&mut stream, "streamed transcript update");
         assert!(
@@ -766,11 +1023,27 @@ mod tests {
         }
     }
 
+    fn response_body(response: &str) -> &str {
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("response should include headers and body")
+    }
+
     fn empty_snapshot() -> RemoteControlSnapshot {
         RemoteControlSnapshot {
             cwd: "/tmp/codex".to_string(),
             status: "Connected to Codex".to_string(),
             messages: Vec::new(),
+            fork: fork_unavailable(),
+            fork_source: None,
+        }
+    }
+
+    fn fork_unavailable() -> super::RemoteControlForkStatus {
+        super::RemoteControlForkStatus {
+            available: false,
+            thread_id: None,
         }
     }
 }

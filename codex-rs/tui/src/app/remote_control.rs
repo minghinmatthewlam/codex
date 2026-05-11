@@ -1,4 +1,6 @@
 use super::*;
+use crate::remote_control::RemoteControlForkSource;
+use crate::remote_control::RemoteControlForkStatus;
 use crate::remote_control::RemoteControlSnapshot;
 use crate::remote_control::RemoteControlTranscriptItem;
 use crate::remote_control::RemoteControlTranscriptRole;
@@ -104,7 +106,30 @@ impl App {
                     text,
                 })
                 .collect(),
+            fork: self.remote_control_fork_status(),
+            fork_source: self.remote_control_fork_source(),
         }
+    }
+
+    fn remote_control_fork_status(&self) -> RemoteControlForkStatus {
+        let thread_id = self
+            .primary_session_configured
+            .as_ref()
+            .filter(|session| session.rollout_path.is_some())
+            .map(|session| session.thread_id.to_string());
+        RemoteControlForkStatus {
+            available: thread_id.is_some(),
+            thread_id,
+        }
+    }
+
+    fn remote_control_fork_source(&self) -> Option<RemoteControlForkSource> {
+        let session = self.primary_session_configured.as_ref()?;
+        Some(RemoteControlForkSource {
+            thread_id: session.thread_id.to_string(),
+            cwd: session.cwd.display().to_string(),
+            rollout_path: session.rollout_path.clone()?,
+        })
     }
 }
 

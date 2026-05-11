@@ -47,6 +47,11 @@ header {
   justify-content: space-between;
   gap: 12px;
 }
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 h1 {
   margin: 0;
   font-size: 18px;
@@ -82,6 +87,25 @@ h1 {
   border-radius: 8px;
   padding: 18px;
   background: rgba(255, 250, 241, 0.62);
+}
+.fork-command {
+  margin: 0 0 14px;
+  border: 1px solid rgba(47, 111, 99, 0.28);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(255, 250, 241, 0.82);
+}
+.fork-command .label {
+  margin-bottom: 6px;
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 700;
+}
+.fork-command code {
+  display: block;
+  color: var(--ink);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
 }
 .message {
   margin: 0 0 12px;
@@ -160,6 +184,19 @@ button {
 button:disabled {
   background: #b9ab9a;
 }
+.fork-button {
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(47, 111, 99, 0.26);
+  background: rgba(47, 111, 99, 0.12);
+  color: var(--accent-dark);
+  font-size: 13px;
+}
+.fork-button:disabled {
+  background: rgba(145, 128, 105, 0.16);
+  color: var(--muted);
+}
 </style>
 </head>
 <body>
@@ -167,7 +204,10 @@ button:disabled {
   <header>
     <div class="topline">
       <h1>Codex</h1>
-      <div class="pill" id="connection">Connecting</div>
+      <div class="actions">
+        <button class="fork-button" id="fork" type="button" disabled>Fork</button>
+        <div class="pill" id="connection">Connecting</div>
+      </div>
     </div>
     <div class="cwd" id="cwd"></div>
   </header>
@@ -189,7 +229,9 @@ const send = document.getElementById("send");
 const messages = document.getElementById("messages");
 const connection = document.getElementById("connection");
 const cwd = document.getElementById("cwd");
+const fork = document.getElementById("fork");
 let lastSnapshot = null;
+let lastForkCommand = null;
 
 function tokenParam() {
   return `token=${encodeURIComponent(token)}`;
@@ -199,11 +241,12 @@ function render(snapshot) {
   lastSnapshot = snapshot;
   connection.textContent = snapshot.status || "Connected";
   cwd.textContent = snapshot.cwd || "";
+  fork.disabled = !snapshot.fork?.available;
   if (!snapshot.messages || snapshot.messages.length === 0) {
-    messages.innerHTML = '<div class="empty">No transcript yet.</div>';
+    messages.replaceChildren(...forkCommandNodes(), emptyNode("No transcript yet."));
     return;
   }
-  messages.replaceChildren(...snapshot.messages.map((item) => {
+  messages.replaceChildren(...forkCommandNodes(), ...snapshot.messages.map((item) => {
     const row = document.createElement("div");
     row.className = `message ${item.role || "status"}`;
     const bubble = document.createElement("div");
@@ -213,6 +256,26 @@ function render(snapshot) {
     return row;
   }));
   requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
+}
+
+function emptyNode(text) {
+  const node = document.createElement("div");
+  node.className = "empty";
+  node.textContent = text;
+  return node;
+}
+
+function forkCommandNodes() {
+  if (!lastForkCommand) return [];
+  const wrapper = document.createElement("div");
+  wrapper.className = "fork-command";
+  const label = document.createElement("div");
+  label.className = "label";
+  label.textContent = "Run on the other laptop";
+  const code = document.createElement("code");
+  code.textContent = lastForkCommand;
+  wrapper.append(label, code);
+  return [wrapper];
 }
 
 async function loadState() {
@@ -265,6 +328,24 @@ form.addEventListener("submit", async (event) => {
   message.value = "";
   message.style.height = "auto";
   connection.textContent = "Sent";
+});
+
+fork.addEventListener("click", async () => {
+  fork.disabled = true;
+  connection.textContent = "Forking";
+  const response = await fetch(`/api/fork?${tokenParam()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  });
+  if (!response.ok) {
+    connection.textContent = `Fork failed ${response.status}`;
+    render(lastSnapshot || { messages: [], fork: { available: false } });
+    return;
+  }
+  const payload = await response.json();
+  lastForkCommand = payload.command;
+  connection.textContent = "Fork ready";
+  render(lastSnapshot || { messages: [], fork: { available: true } });
 });
 
 loadState().catch(() => {
