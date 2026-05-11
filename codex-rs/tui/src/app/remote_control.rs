@@ -93,6 +93,11 @@ impl App {
                 lines_to_text(lines),
             );
         }
+        let fork_source = self.remote_control_fork_source();
+        let fork = RemoteControlForkStatus {
+            available: fork_source.is_some(),
+            thread_id: fork_source.as_ref().map(|source| source.thread_id.clone()),
+        };
 
         RemoteControlSnapshot {
             cwd: self.config.cwd.display().to_string(),
@@ -106,29 +111,21 @@ impl App {
                     text,
                 })
                 .collect(),
-            fork: self.remote_control_fork_status(),
-            fork_source: self.remote_control_fork_source(),
-        }
-    }
-
-    fn remote_control_fork_status(&self) -> RemoteControlForkStatus {
-        let thread_id = self
-            .primary_session_configured
-            .as_ref()
-            .filter(|session| session.rollout_path.is_some())
-            .map(|session| session.thread_id.to_string());
-        RemoteControlForkStatus {
-            available: thread_id.is_some(),
-            thread_id,
+            fork,
+            fork_source,
         }
     }
 
     fn remote_control_fork_source(&self) -> Option<RemoteControlForkSource> {
         let session = self.primary_session_configured.as_ref()?;
+        let rollout_path = session.rollout_path.clone()?;
+        if !rollout_path.is_file() {
+            return None;
+        }
         Some(RemoteControlForkSource {
             thread_id: session.thread_id.to_string(),
             cwd: session.cwd.display().to_string(),
-            rollout_path: session.rollout_path.clone()?,
+            rollout_path,
         })
     }
 }
