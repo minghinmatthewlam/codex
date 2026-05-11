@@ -61,7 +61,9 @@ async fn remote_control_slash_command_stops_sidecar() -> anyhow::Result<()> {
         Regex::new(r"http://(?:127\.0\.0\.1|\d+\.\d+\.\d+\.\d+):\d+\?token=[A-Za-z0-9_-]+")?;
     let mut output = Vec::new();
     let mut start_sent = false;
+    let mut start_submitted = false;
     let mut stop_sent = false;
+    let mut stop_submitted = false;
     let mut control_url = None;
 
     let proof = timeout(Duration::from_secs(20), async {
@@ -74,23 +76,34 @@ async fn remote_control_slash_command_stops_sidecar() -> anyhow::Result<()> {
                         }
                         output.extend_from_slice(&chunk);
                         let visible_output = String::from_utf8_lossy(&output);
-                        if !start_sent && visible_output.contains("gpt-5.5 default") {
+                        let plain_output = plain_terminal_text(&output);
+                        if !start_sent && plain_output.contains("gpt-5.5 default") {
                             let _ = writer_tx.send(b"/remote-control".to_vec()).await;
-                            sleep(Duration::from_millis(100)).await;
-                            let _ = writer_tx.send(b"\r".to_vec()).await;
                             start_sent = true;
                         }
                         if start_sent
+                            && !start_submitted
+                            && plain_output.contains("/remote-control")
+                        {
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            start_submitted = true;
+                        }
+                        if start_submitted
                             && !stop_sent
                             && let Some(found) = url_regex.find(&visible_output)
                         {
                             control_url = Some(found.as_str().to_string());
                             let _ = writer_tx.send(b"/remote-control stop".to_vec()).await;
-                            sleep(Duration::from_millis(100)).await;
-                            let _ = writer_tx.send(b"\r".to_vec()).await;
                             stop_sent = true;
                         }
-                        if stop_sent && visible_output.contains("Remote control stopped.") {
+                        if stop_sent
+                            && !stop_submitted
+                            && plain_output.contains("/remote-control stop")
+                        {
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            stop_submitted = true;
+                        }
+                        if stop_submitted && visible_output.contains("Remote control stopped.") {
                             let control_url = control_url
                                 .as_deref()
                                 .context("remote-control URL should be captured before stop")?;
@@ -151,6 +164,7 @@ async fn run_remote_control_tui_smoke(
     let mut output = Vec::new();
     let mut posted = false;
     let mut slash_command_sent = matches!(start, RemoteControlStart::CommandLineFlag);
+    let mut slash_command_submitted = matches!(start, RemoteControlStart::CommandLineFlag);
 
     let proof = timeout(Duration::from_secs(20), async {
         loop {
@@ -162,11 +176,17 @@ async fn run_remote_control_tui_smoke(
                         }
                         output.extend_from_slice(&chunk);
                         let visible_output = String::from_utf8_lossy(&output);
-                        if !slash_command_sent && visible_output.contains("gpt-5.5 default") {
+                        let plain_output = plain_terminal_text(&output);
+                        if !slash_command_sent && plain_output.contains("gpt-5.5 default") {
                             let _ = writer_tx.send(b"/remote-control".to_vec()).await;
-                            sleep(Duration::from_millis(100)).await;
-                            let _ = writer_tx.send(b"\r".to_vec()).await;
                             slash_command_sent = true;
+                        }
+                        if slash_command_sent
+                            && !slash_command_submitted
+                            && plain_output.contains("/remote-control")
+                        {
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            slash_command_submitted = true;
                         }
                         if !posted
                             && let Some(found) = url_regex.find(&visible_output)
@@ -211,14 +231,20 @@ async fn spawn_remote_control_tui(args: &[String]) -> anyhow::Result<SpawnedRemo
     let tmp = tempfile::tempdir()?;
     let codex_home = tmp.path();
     let cwd = std::env::current_dir()?;
+    let repo_root = cwd
+        .ancestors()
+        .nth(2)
+        .context("tui test should run from inside the codex repo")?;
     let config_contents = format!(
         r#"
 model_provider = "ollama"
 
 [projects]
 "{cwd}" = {{ trust_level = "trusted" }}
+"{repo_root}" = {{ trust_level = "trusted" }}
 "#,
-        cwd = cwd.display()
+        cwd = cwd.display(),
+        repo_root = repo_root.display()
     );
     std::fs::write(codex_home.join("config.toml"), config_contents)?;
 
@@ -310,4 +336,58 @@ async fn wait_for_remote_control_server_to_stop(control_url: &str) -> anyhow::Re
 fn output_tail(output: &[u8]) -> String {
     let start = output.len().saturating_sub(4096);
     String::from_utf8_lossy(&output[start..]).to_string()
+}
+
+fn plain_terminal_text(output: &[u8]) -> String {
+    let mut plain = String::new();
+    let mut index = 0;
+    while index < output.len() {
+        if output[index] == 0x1b {
+            index += 1;
+            if index >= output.len() {
+                break;
+            }
+            match output[index] {
+                b'[' => {
+                    index += 1;
+                    while index < output.len() && !(0x40..=0x7e).contains(&output[index]) {
+                        index += 1;
+                    }
+                    index += usize::from(index < output.len());
+                }
+                b']' => {
+                    index += 1;
+                    while index < output.len() {
+                        if output[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if output[index] == 0x1b
+                            && output.get(index + 1).is_some_and(|byte| *byte == b'\\')
+                        {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+
+        let byte = output[index];
+        if byte == b'\n'
+            || byte == b'\r'
+            || byte == b'\t'
+            || byte.is_ascii_graphic()
+            || byte == b' '
+        {
+            plain.push(byte as char);
+        }
+        index += 1;
+    }
+    plain
 }
