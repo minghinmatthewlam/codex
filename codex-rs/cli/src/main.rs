@@ -45,6 +45,7 @@ mod app_cmd;
 mod desktop_app;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod remote_fork;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -158,6 +159,9 @@ enum Subcommand {
 
     /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
     Fork(ForkCommand),
+
+    /// Import a live remote fork claim and start a local forked session.
+    RemoteFork(RemoteForkCommand),
 
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
     #[clap(name = "cloud", alias = "cloud-tasks")]
@@ -314,6 +318,19 @@ struct ForkCommand {
     /// Show all sessions (disables cwd filtering and shows CWD column).
     #[arg(long = "all", default_value_t = false)]
     all: bool,
+
+    #[clap(flatten)]
+    remote: InteractiveRemoteOptions,
+
+    #[clap(flatten)]
+    config_overrides: TuiCli,
+}
+
+#[derive(Debug, Parser)]
+struct RemoteForkCommand {
+    /// Fork claim emitted by a paired Codex Remote client.
+    #[arg(value_name = "CODE")]
+    code: String,
 
     #[clap(flatten)]
     remote: InteractiveRemoteOptions,
@@ -780,7 +797,9 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     if root_local_remote_control.is_some()
         && !matches!(
             &subcommand,
-            None | Some(Subcommand::Resume(_)) | Some(Subcommand::Fork(_))
+            None | Some(Subcommand::Resume(_))
+                | Some(Subcommand::Fork(_))
+                | Some(Subcommand::RemoteFork(_))
         )
     {
         anyhow::bail!("`--remote-control` is only supported for interactive TUI commands");
@@ -997,6 +1016,34 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 session_id,
                 last,
                 all,
+                config_overrides,
+            );
+            let local_remote_control =
+                local_remote_control_options(&remote)?.or(root_local_remote_control.clone());
+            let exit_info = run_interactive_tui(
+                interactive,
+                remote.remote.or(root_remote.clone()),
+                remote
+                    .remote_auth_token_env
+                    .or(root_remote_auth_token_env.clone()),
+                local_remote_control,
+                arg0_paths.clone(),
+            )
+            .await?;
+            handle_app_exit(exit_info)?;
+        }
+        Some(Subcommand::RemoteFork(RemoteForkCommand {
+            code,
+            remote,
+            config_overrides,
+        })) => {
+            let imported = remote_fork::import_remote_fork(&code).await?;
+            interactive = finalize_fork_interactive(
+                interactive,
+                root_config_overrides.clone(),
+                Some(imported.thread_id),
+                /*last*/ false,
+                /*show_all*/ true,
                 config_overrides,
             );
             let local_remote_control =
@@ -2332,6 +2379,20 @@ mod tests {
         let interactive = finalize_fork_from_args(["codex", "fork", "--all"].as_ref());
         assert!(interactive.fork_picker);
         assert!(interactive.fork_show_all);
+    }
+
+    #[test]
+    fn remote_fork_parses_claim_code() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "remote-fork",
+            "http://127.0.0.1:4444/api/forks/demo?token=t",
+        ])
+        .expect("parse");
+        let Some(Subcommand::RemoteFork(RemoteForkCommand { code, .. })) = cli.subcommand else {
+            panic!("expected remote-fork subcommand");
+        };
+        assert_eq!(code, "http://127.0.0.1:4444/api/forks/demo?token=t");
     }
 
     #[test]
