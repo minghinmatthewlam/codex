@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 use regex_lite::Regex;
 use tokio::select;
+use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
@@ -38,6 +39,108 @@ async fn remote_control_slash_command_starts_sidecar() -> anyhow::Result<()> {
         "remote control slash smoke test prompt",
     )
     .await
+}
+
+#[tokio::test]
+async fn remote_control_slash_command_serves_existing_history() -> anyhow::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let args = vec!["-c".to_string(), "analytics.enabled=false".to_string()];
+    let spawned_tui = spawn_remote_control_tui(&args).await?;
+    let codex_utils_pty::SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned_tui.spawned;
+    let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
+    let mut exit_rx = exit_rx;
+    let writer_tx = session.writer_sender();
+    let url_regex =
+        Regex::new(r"http://(?:127\.0\.0\.1|\d+\.\d+\.\d+\.\d+):\d+\?token=[A-Za-z0-9_-]+")?;
+    let mut output = Vec::new();
+    let mut history_typed = false;
+    let mut history_submitted_at = None;
+    let mut remote_sent = false;
+    let mut remote_submitted = false;
+    let existing_history = "existing history before remote control";
+
+    let proof = timeout(Duration::from_secs(20), async {
+        loop {
+            select! {
+                _ = sleep_until(history_submitted_at), if history_submitted_at.is_some() && !remote_sent => {
+                    let _ = writer_tx.send(b"/remote-control".to_vec()).await;
+                    remote_sent = true;
+                }
+                result = output_rx.recv() => match result {
+                    Ok(chunk) => {
+                        if chunk.windows(4).any(|window| window == b"\x1b[6n") {
+                            let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
+                        }
+                        output.extend_from_slice(&chunk);
+                        let visible_output = String::from_utf8_lossy(&output);
+                        let plain_output = plain_terminal_text(&output);
+                        if !history_typed && plain_output.contains("gpt-5.5 default") {
+                            let _ = writer_tx
+                                .send(existing_history.as_bytes().to_vec())
+                                .await;
+                            history_typed = true;
+                        }
+                        if history_typed
+                            && history_submitted_at.is_none()
+                            && plain_output.contains("existing")
+                            && plain_output.contains("control")
+                        {
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            history_submitted_at = Some(Instant::now() + Duration::from_millis(300));
+                        }
+                        if remote_sent
+                            && !remote_submitted
+                            && plain_output.contains("/remote-control")
+                        {
+                            let _ = writer_tx.send(b"\r".to_vec()).await;
+                            remote_submitted = true;
+                        }
+                        if remote_submitted
+                            && let Some(found) = url_regex.find(&visible_output)
+                        {
+                            let state = get_remote_control_state(found.as_str())?;
+                            if state.contains(existing_history) {
+                                return Ok(());
+                            }
+                            anyhow::bail!("remote-control state did not include existing history: {state}");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("codex output closed before remote-control served existing history: {}", output_tail(&output));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                },
+                result = &mut exit_rx => {
+                    let exit_code = result.context("codex exit channel closed")?;
+                    anyhow::bail!("codex exited with {exit_code} before remote-control served existing history: {}", output_tail(&output));
+                }
+            }
+        }
+    })
+    .await;
+
+    session.terminate();
+    match proof {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "timed out waiting for remote-control existing history: {}",
+            output_tail(&output)
+        ),
+    }
+}
+
+async fn sleep_until(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 #[tokio::test]
@@ -312,6 +415,39 @@ fn post_remote_control_message(control_url: &str, prompt: &str) -> anyhow::Resul
     } else {
         anyhow::bail!("unexpected remote-control response: {response}");
     }
+}
+
+fn get_remote_control_state(control_url: &str) -> anyhow::Result<String> {
+    let url = url::Url::parse(control_url).context("remote-control URL should parse")?;
+    let port = url
+        .port()
+        .context("remote-control URL should include port")?;
+    let token = url
+        .query_pairs()
+        .find_map(|(name, value)| (name == "token").then(|| value.into_owned()))
+        .context("remote-control URL should include token")?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let request = format!(
+        "GET /api/state?token={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect(addr).context("connect remote-control server")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("set remote-control read timeout")?;
+    stream
+        .write_all(request.as_bytes())
+        .context("write remote-control state request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read remote-control state response")?;
+    if !response.starts_with("HTTP/1.1 200 OK") {
+        anyhow::bail!("unexpected remote-control state response: {response}");
+    }
+    Ok(response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default())
 }
 
 async fn wait_for_remote_control_server_to_stop(control_url: &str) -> anyhow::Result<()> {
