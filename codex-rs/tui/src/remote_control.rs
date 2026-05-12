@@ -369,7 +369,7 @@ pub(crate) fn start_local_server(
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_shared_state = shared_state.clone();
-    let thread_public_base_url = public_base_url.clone();
+    let thread_public_base_url = public_base_url;
     let join_handle = thread::Builder::new()
         .name("codex-remote-control".to_string())
         .spawn(move || {
