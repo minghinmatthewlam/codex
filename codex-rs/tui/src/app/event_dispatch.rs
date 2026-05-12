@@ -1770,7 +1770,11 @@ impl App {
                 self.chat_widget.submit_remote_control_user_message(text);
             }
             AppEvent::StartRemoteControl => {
-                self.start_local_remote_control(self.local_remote_control_options.clone());
+                self.start_local_remote_control(
+                    app_server,
+                    self.local_remote_control_options.clone(),
+                )
+                .await;
             }
             AppEvent::StopRemoteControl => {
                 self.stop_local_remote_control();

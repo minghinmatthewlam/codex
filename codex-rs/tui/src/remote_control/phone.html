@@ -135,6 +135,33 @@ h1 {
   color: #5f5142;
   font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+details.bubble {
+  display: block;
+}
+details.bubble summary {
+  cursor: pointer;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #5f5142;
+  list-style: none;
+}
+details.bubble summary::-webkit-details-marker {
+  display: none;
+}
+details.bubble summary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 7px;
+  transform: translateY(-1px);
+}
+details.bubble[open] summary::before {
+  transform: rotate(90deg) translateX(1px);
+}
+details.bubble pre {
+  margin: 9px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
 form {
   position: fixed;
   left: 0;
@@ -249,13 +276,29 @@ function render(snapshot) {
   messages.replaceChildren(...forkCommandNodes(), ...snapshot.messages.map((item) => {
     const row = document.createElement("div");
     row.className = `message ${item.role || "status"}`;
-    const bubble = document.createElement("div");
-    bubble.className = "bubble";
-    bubble.textContent = item.text || "";
+    const bubble = bubbleForItem(item);
     row.appendChild(bubble);
     return row;
   }));
   requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
+}
+
+function bubbleForItem(item) {
+  const role = item.role || "status";
+  if (role === "tool" || role === "status") {
+    const details = document.createElement("details");
+    details.className = "bubble";
+    const summary = document.createElement("summary");
+    summary.textContent = role === "tool" ? "Tool output" : "Session status";
+    const body = document.createElement("pre");
+    body.textContent = item.text || "";
+    details.append(summary, body);
+    return details;
+  }
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = item.text || "";
+  return bubble;
 }
 
 function emptyNode(text) {

@@ -25,6 +25,7 @@ use serde::Serialize;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 
+mod app_server_snapshot;
 mod qr;
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1054,5 +1055,13 @@ mod tests {
             available: false,
             thread_id: None,
         }
+    }
+
+    #[test]
+    fn phone_html_collapses_tool_and_status_blocks_by_default() {
+        let html = super::remote_control_html("test-token");
+        assert!(html.contains("function bubbleForItem(item)"));
+        assert!(html.contains("role === \"tool\" || role === \"status\""));
+        assert!(html.contains("document.createElement(\"details\")"));
     }
 }

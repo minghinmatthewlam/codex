@@ -927,7 +927,8 @@ See the Codex keymap documentation for supported actions and examples."
             }
         }
         if let Some(options) = startup_local_remote_control {
-            app.start_local_remote_control(options);
+            app.start_local_remote_control(&mut app_server, options)
+                .await;
         }
 
         // On startup, if a managed filesystem sandbox is active, warn about

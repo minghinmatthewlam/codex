@@ -8,8 +8,9 @@ use crate::remote_control::RemoteControlTranscriptRole;
 const REMOTE_CONTROL_TRANSCRIPT_WIDTH: u16 = 88;
 
 impl App {
-    pub(super) fn start_local_remote_control(
+    pub(super) async fn start_local_remote_control(
         &mut self,
+        app_server: &mut AppServerSession,
         options: crate::remote_control::LocalRemoteControlOptions,
     ) {
         if self.local_remote_control_server.is_some() {
@@ -17,7 +18,10 @@ impl App {
             return;
         }
 
-        let snapshot = self.remote_control_snapshot();
+        let snapshot = self
+            .remote_control_snapshot_from_app_server(app_server)
+            .await
+            .unwrap_or_else(|| self.remote_control_snapshot());
         match crate::remote_control::start_local_server(
             options.clone(),
             self.app_event_tx.clone(),
@@ -113,6 +117,29 @@ impl App {
                 .collect(),
             fork,
             fork_source,
+        }
+    }
+
+    async fn remote_control_snapshot_from_app_server(
+        &mut self,
+        app_server: &mut AppServerSession,
+    ) -> Option<RemoteControlSnapshot> {
+        let thread_id = self.current_displayed_thread_id()?;
+        match app_server
+            .thread_read(thread_id, /*include_turns*/ true)
+            .await
+        {
+            Ok(thread) => Some(RemoteControlSnapshot::from_app_server_thread(
+                &thread,
+                self.remote_control_fork_source(),
+            )),
+            Err(err) => {
+                tracing::warn!(
+                    %thread_id,
+                    "failed to read app-server thread for remote-control snapshot: {err:#}"
+                );
+                None
+            }
         }
     }
 
