@@ -1,11 +1,7 @@
 use super::*;
+use crate::remote_control::REMOTE_CONTROL_TRANSCRIPT_WIDTH;
 use crate::remote_control::RemoteControlForkSource;
-use crate::remote_control::RemoteControlForkStatus;
 use crate::remote_control::RemoteControlSnapshot;
-use crate::remote_control::RemoteControlTranscriptItem;
-use crate::remote_control::RemoteControlTranscriptRole;
-
-const REMOTE_CONTROL_TRANSCRIPT_WIDTH: u16 = 88;
 
 impl App {
     pub(super) async fn start_local_remote_control(
@@ -81,43 +77,13 @@ impl App {
     }
 
     fn remote_control_snapshot(&self) -> RemoteControlSnapshot {
-        let mut messages = Vec::new();
-        for cell in &self.transcript_cells {
-            let role = role_for_cell(cell.as_ref());
-            let text = text_for_cell(cell.as_ref());
-            push_remote_control_text(&mut messages, role, text);
-        }
-        if let Some(lines) = self
-            .chat_widget
-            .active_cell_transcript_lines(REMOTE_CONTROL_TRANSCRIPT_WIDTH)
-        {
-            push_remote_control_text(
-                &mut messages,
-                RemoteControlTranscriptRole::Assistant,
-                lines_to_text(lines),
-            );
-        }
-        let fork_source = self.remote_control_fork_source();
-        let fork = RemoteControlForkStatus {
-            available: fork_source.is_some(),
-            thread_id: fork_source.as_ref().map(|source| source.thread_id.clone()),
-        };
-
-        RemoteControlSnapshot {
-            cwd: self.config.cwd.display().to_string(),
-            status: "Connected to Codex".to_string(),
-            messages: messages
-                .into_iter()
-                .enumerate()
-                .map(|(index, (role, text))| RemoteControlTranscriptItem {
-                    id: index.saturating_add(1),
-                    role,
-                    text,
-                })
-                .collect(),
-            fork,
-            fork_source,
-        }
+        RemoteControlSnapshot::from_transcript_cells(
+            self.config.cwd.display().to_string(),
+            self.remote_control_fork_source(),
+            &self.transcript_cells,
+            self.chat_widget
+                .active_cell_transcript_lines(REMOTE_CONTROL_TRANSCRIPT_WIDTH),
+        )
     }
 
     async fn remote_control_snapshot_from_app_server(
@@ -131,6 +97,7 @@ impl App {
         {
             Ok(thread) => Some(RemoteControlSnapshot::from_app_server_thread(
                 &thread,
+                self.config.show_raw_agent_reasoning,
                 self.remote_control_fork_source(),
             )),
             Err(err) => {
@@ -155,68 +122,4 @@ impl App {
             rollout_path,
         })
     }
-}
-
-fn role_for_cell(cell: &dyn HistoryCell) -> RemoteControlTranscriptRole {
-    let any = cell.as_any();
-    if any.is::<history_cell::UserHistoryCell>() {
-        RemoteControlTranscriptRole::User
-    } else if any.is::<history_cell::AgentMessageCell>()
-        || any.is::<history_cell::AgentMarkdownCell>()
-        || any.is::<history_cell::ReasoningSummaryCell>()
-        || any.is::<history_cell::ProposedPlanCell>()
-        || any.is::<history_cell::ProposedPlanStreamCell>()
-        || any.is::<history_cell::PlanUpdateCell>()
-    {
-        RemoteControlTranscriptRole::Assistant
-    } else if any.is::<history_cell::PlainHistoryCell>()
-        || any.is::<history_cell::SessionHeaderHistoryCell>()
-    {
-        RemoteControlTranscriptRole::Status
-    } else {
-        RemoteControlTranscriptRole::Tool
-    }
-}
-
-fn text_for_cell(cell: &dyn HistoryCell) -> String {
-    let raw_lines = cell.raw_lines();
-    if raw_lines.is_empty() {
-        lines_to_text(cell.transcript_lines(REMOTE_CONTROL_TRANSCRIPT_WIDTH))
-    } else {
-        lines_to_text(raw_lines)
-    }
-}
-
-fn push_remote_control_text(
-    messages: &mut Vec<(RemoteControlTranscriptRole, String)>,
-    role: RemoteControlTranscriptRole,
-    text: String,
-) {
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return;
-    }
-
-    if let Some((last_role, last_text)) = messages.last_mut()
-        && *last_role == role
-    {
-        last_text.push_str("\n\n");
-        last_text.push_str(&text);
-        return;
-    }
-
-    messages.push((role, text));
-}
-
-fn lines_to_text(lines: Vec<Line<'static>>) -> String {
-    lines
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .into_iter()
-                .map(|span| span.content.into_owned())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }

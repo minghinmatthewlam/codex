@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod transcript;
+pub(crate) use transcript::RawReasoningVisibility;
+pub(crate) use transcript::thread_to_transcript_cells;
 
 use crate::app_server_session::AppServerSession;
 use crate::color::blend;
@@ -56,7 +58,6 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
-use transcript::RawReasoningVisibility;
 use transcript::TranscriptCells;
 use transcript::load_session_transcript;
 use unicode_width::UnicodeWidthStr;
