@@ -292,6 +292,7 @@ async fn run_remote_control_tui_smoke(
                             slash_command_submitted = true;
                         }
                         if !posted
+                            && visible_output.contains("Share link:")
                             && let Some(found) = url_regex.find(&visible_output)
                         {
                             post_remote_control_message(found.as_str(), prompt)?;

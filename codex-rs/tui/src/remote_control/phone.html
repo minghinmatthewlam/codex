@@ -224,6 +224,27 @@ button:disabled {
   background: rgba(145, 128, 105, 0.16);
   color: var(--muted);
 }
+.share-button {
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(146, 122, 91, 0.3);
+  background: rgba(255, 250, 241, 0.82);
+  color: var(--muted);
+  font-size: 13px;
+}
+.readonly-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 12px 14px max(12px, env(safe-area-inset-bottom));
+  border-top: 1px solid rgba(146, 122, 91, 0.24);
+  background: rgba(250, 243, 231, 0.92);
+  color: var(--muted);
+  font-size: 13px;
+  backdrop-filter: blur(18px);
+}
 </style>
 </head>
 <body>
@@ -233,6 +254,7 @@ button:disabled {
       <h1>Codex</h1>
       <div class="actions">
         <button class="fork-button" id="fork" type="button" disabled>Fork</button>
+        <button class="share-button" id="share" type="button">Share</button>
         <div class="pill" id="connection">Connecting</div>
       </div>
     </div>
@@ -247,9 +269,15 @@ button:disabled {
       <button id="send" type="submit">Send</button>
     </div>
   </form>
+  <div class="readonly-bar" id="readonly" hidden>
+    Read-only share view. Watch live, or fork to continue on your computer.
+  </div>
 </div>
 <script>
-const token = "__TOKEN__";
+const token = __TOKEN_JSON__;
+const accessMode = __ACCESS_MODE_JSON__;
+const shareUrl = __SHARE_URL_JSON__;
+const canControl = accessMode === "controller";
 const message = document.getElementById("message");
 const form = document.getElementById("form");
 const send = document.getElementById("send");
@@ -257,8 +285,15 @@ const messages = document.getElementById("messages");
 const connection = document.getElementById("connection");
 const cwd = document.getElementById("cwd");
 const fork = document.getElementById("fork");
+const share = document.getElementById("share");
+const readonly = document.getElementById("readonly");
 let lastSnapshot = null;
 let lastForkCommand = null;
+
+if (!canControl) {
+  form.hidden = true;
+  readonly.hidden = false;
+}
 
 function tokenParam() {
   return `token=${encodeURIComponent(token)}`;
@@ -354,6 +389,7 @@ message.addEventListener("keydown", (event) => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!canControl) return;
   const text = message.value.trim();
   if (!text) return;
   send.disabled = true;
@@ -389,6 +425,24 @@ fork.addEventListener("click", async () => {
   lastForkCommand = payload.command;
   connection.textContent = "Fork ready";
   render(lastSnapshot || { messages: [], fork: { available: true } });
+});
+
+share.addEventListener("click", async () => {
+  try {
+    if (navigator.share) {
+      await navigator.share({ title: "Codex session", url: shareUrl });
+      connection.textContent = "Share sheet opened";
+      return;
+    }
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(shareUrl);
+      connection.textContent = "Share link copied";
+      return;
+    }
+  } catch (_) {
+    connection.textContent = "Share canceled";
+  }
+  window.prompt("Share this read-only link", shareUrl);
 });
 
 loadState().catch(() => {

@@ -215,6 +215,18 @@ struct ForkPostResponse {
     command: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteControlAccess {
+    Controller,
+    Viewer,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteControlTokens {
+    controller: String,
+    viewer: String,
+}
+
 #[derive(Clone)]
 struct RemoteControlSharedState {
     snapshot: Arc<Mutex<RemoteControlSnapshot>>,
@@ -324,6 +336,7 @@ impl RemoteControlSharedState {
 
 pub(crate) struct LocalRemoteControlServer {
     url: String,
+    share_url: String,
     shared_state: RemoteControlSharedState,
     shutdown: Arc<AtomicBool>,
     join_handle: Option<thread::JoinHandle<()>>,
@@ -332,6 +345,10 @@ pub(crate) struct LocalRemoteControlServer {
 impl LocalRemoteControlServer {
     pub(crate) fn url(&self) -> &str {
         &self.url
+    }
+
+    pub(crate) fn share_url(&self) -> &str {
+        &self.share_url
     }
 
     pub(crate) fn qr_lines(&self) -> Vec<ratatui::text::Line<'static>> {
@@ -362,21 +379,27 @@ pub(crate) fn start_local_server(
     let listener = TcpListener::bind(options.bind_addr)?;
     listener.set_nonblocking(true)?;
     let local_addr = listener.local_addr()?;
-    let token = generate_token();
+    let tokens = RemoteControlTokens {
+        controller: generate_token(),
+        viewer: generate_token(),
+    };
     let public_base_url = control_base_url(local_addr);
-    let url = format!("{public_base_url}?token={token}");
+    let url = format!("{public_base_url}?token={}", tokens.controller);
+    let share_url = format!("{public_base_url}?token={}", tokens.viewer);
     let shared_state = RemoteControlSharedState::new(initial_snapshot);
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_shared_state = shared_state.clone();
     let thread_public_base_url = public_base_url;
+    let thread_share_url = share_url.clone();
     let join_handle = thread::Builder::new()
         .name("codex-remote-control".to_string())
         .spawn(move || {
             serve(
                 listener,
-                token,
+                tokens,
                 thread_public_base_url,
+                thread_share_url,
                 app_event_tx,
                 thread_shared_state,
                 thread_shutdown,
@@ -386,6 +409,7 @@ pub(crate) fn start_local_server(
 
     Ok(LocalRemoteControlServer {
         url,
+        share_url,
         shared_state,
         shutdown,
         join_handle: Some(join_handle),
@@ -394,8 +418,9 @@ pub(crate) fn start_local_server(
 
 fn serve(
     listener: TcpListener,
-    token: String,
+    tokens: RemoteControlTokens,
     public_base_url: String,
+    share_url: String,
     app_event_tx: AppEventSender,
     shared_state: RemoteControlSharedState,
     shutdown: Arc<AtomicBool>,
@@ -403,8 +428,9 @@ fn serve(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let token = token.clone();
+                let tokens = tokens.clone();
                 let public_base_url = public_base_url.clone();
+                let share_url = share_url.clone();
                 let app_event_tx = app_event_tx.clone();
                 let shared_state = shared_state.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -414,8 +440,9 @@ fn serve(
                     let _ = stream.set_write_timeout(Some(DEFAULT_RESPONSE_TIMEOUT));
                     if let Err(err) = handle_connection(
                         &mut stream,
-                        &token,
+                        &tokens,
                         &public_base_url,
+                        &share_url,
                         &app_event_tx,
                         &shared_state,
                         &shutdown,
@@ -437,28 +464,29 @@ fn serve(
 
 fn handle_connection(
     stream: &mut TcpStream,
-    token: &str,
+    tokens: &RemoteControlTokens,
     public_base_url: &str,
+    share_url: &str,
     app_event_tx: &AppEventSender,
     shared_state: &RemoteControlSharedState,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let request = read_request(stream)?;
-    if !is_authorized(&request, token) {
+    let Some(access) = authorize_request(&request, tokens) else {
         return write_response(
             stream,
             "401 Unauthorized",
             "text/plain; charset=utf-8",
             "Unauthorized\n",
         );
-    }
+    };
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => write_response(
             stream,
             "200 OK",
             "text/html; charset=utf-8",
-            &remote_control_html(token),
+            &remote_control_html(token_for_access(tokens, access), access, share_url),
         ),
         ("GET", "/health") => {
             write_response(stream, "200 OK", "application/json", r#"{"ok":true}"#)
@@ -470,8 +498,18 @@ fn handle_connection(
             &shared_state.snapshot_json(),
         ),
         ("GET", "/api/events") => handle_event_stream(stream, shared_state, shutdown),
-        ("POST", "/api/message") => handle_message_post(stream, request, app_event_tx),
-        ("POST", "/api/fork") => handle_fork_post(stream, shared_state, public_base_url, token),
+        ("POST", "/api/message") if access == RemoteControlAccess::Controller => {
+            handle_message_post(stream, request, app_event_tx)
+        }
+        ("POST", "/api/message") => write_response(
+            stream,
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "Shared viewers are read-only. Fork this session to continue on your own computer.\n",
+        ),
+        ("POST", "/api/fork") => {
+            handle_fork_post(stream, shared_state, public_base_url, &tokens.viewer)
+        }
         ("GET", path) if path.starts_with("/api/forks/") => {
             handle_fork_bundle_get(stream, shared_state, path)
         }
@@ -715,17 +753,46 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn is_authorized(request: &HttpRequest, token: &str) -> bool {
-    let query_token_matches = request.query.as_deref().is_some_and(|query| {
-        query.split('&').any(|pair| {
-            pair.split_once('=')
-                .is_some_and(|(name, value)| name == "token" && value == token)
-        })
-    });
-    let bearer_token_matches = header_value(&request.headers, "authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == token);
-    query_token_matches || bearer_token_matches
+fn authorize_request(
+    request: &HttpRequest,
+    tokens: &RemoteControlTokens,
+) -> Option<RemoteControlAccess> {
+    let token = request_token(request)?;
+    if token == tokens.controller {
+        Some(RemoteControlAccess::Controller)
+    } else if token == tokens.viewer {
+        Some(RemoteControlAccess::Viewer)
+    } else {
+        None
+    }
+}
+
+fn request_token(request: &HttpRequest) -> Option<&str> {
+    request.query.as_deref().and_then(query_token).or_else(|| {
+        header_value(&request.headers, "authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+    })
+}
+
+fn query_token(query: &str) -> Option<&str> {
+    query.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .and_then(|(name, value)| (name == "token").then_some(value))
+    })
+}
+
+fn token_for_access(tokens: &RemoteControlTokens, access: RemoteControlAccess) -> &str {
+    match access {
+        RemoteControlAccess::Controller => &tokens.controller,
+        RemoteControlAccess::Viewer => &tokens.viewer,
+    }
+}
+
+fn access_mode(access: RemoteControlAccess) -> &'static str {
+    match access {
+        RemoteControlAccess::Controller => "controller",
+        RemoteControlAccess::Viewer => "viewer",
+    }
 }
 
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -786,8 +853,21 @@ fn local_lan_ip() -> Option<IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
-fn remote_control_html(token: &str) -> String {
-    include_str!("remote_control/phone.html").replace("__TOKEN__", token)
+fn remote_control_html(token: &str, access: RemoteControlAccess, share_url: &str) -> String {
+    include_str!("remote_control/phone.html")
+        .replace(
+            "__TOKEN_JSON__",
+            &serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string()),
+        )
+        .replace(
+            "__ACCESS_MODE_JSON__",
+            &serde_json::to_string(access_mode(access))
+                .unwrap_or_else(|_| "\"viewer\"".to_string()),
+        )
+        .replace(
+            "__SHARE_URL_JSON__",
+            &serde_json::to_string(share_url).unwrap_or_else(|_| "\"\"".to_string()),
+        )
 }
 
 #[cfg(test)]
@@ -804,6 +884,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::LocalRemoteControlOptions;
+    use super::RemoteControlAccess;
     use super::RemoteControlForkSource;
     use super::RemoteControlForkStatus;
     use super::RemoteControlSnapshot;
@@ -891,6 +972,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_link_can_read_state_but_cannot_submit_message() {
+        let (tx, mut rx) = unbounded_channel();
+        let server = start_local_server(
+            LocalRemoteControlOptions {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback addr"),
+            },
+            AppEventSender::new(tx),
+            RemoteControlSnapshot {
+                cwd: "/tmp/codex".to_string(),
+                status: "Connected to Codex".to_string(),
+                messages: vec![RemoteControlTranscriptItem {
+                    id: 1,
+                    role: RemoteControlTranscriptRole::Assistant,
+                    text: "live shared transcript".to_string(),
+                }],
+                fork: fork_unavailable(),
+                fork_source: None,
+            },
+        )
+        .expect("server should start");
+        let control_url = url::Url::parse(server.url()).expect("control URL should parse");
+        let share_url = url::Url::parse(server.share_url()).expect("share URL should parse");
+        assert_ne!(
+            control_url.query(),
+            share_url.query(),
+            "controller and share links must use different tokens"
+        );
+        let share_token = token_from_url(&share_url);
+        let addr = socket_addr_from_url(&share_url);
+
+        let response = send_request(
+            addr,
+            &format!(
+                "GET /api/state?token={share_token} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("live shared transcript"),
+            "unexpected response: {response}"
+        );
+
+        let body = r#"{"message":"viewer should not control"}"#;
+        let response = send_request(
+            addr,
+            &format!(
+                "POST /api/message?token={share_token} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "read-only share link should not emit a prompt event"
+        );
+    }
+
+    #[tokio::test]
     async fn state_endpoint_returns_latest_transcript_snapshot() {
         let (tx, _rx) = unbounded_channel();
         let server = start_local_server(
@@ -963,11 +1110,31 @@ mod tests {
 
     #[test]
     fn phone_html_loads_state_and_event_stream() {
-        let html = super::remote_control_html("test-token");
+        let html = super::remote_control_html(
+            "test-token",
+            RemoteControlAccess::Controller,
+            "http://127.0.0.1:1?token=share-token",
+        );
         assert!(html.contains("/api/state?"));
         assert!(html.contains("new EventSource"));
         assert!(html.contains("Loading the Codex transcript"));
         assert!(html.contains("test-token"));
+        assert!(html.contains("share-token"));
+        assert!(html.contains("const accessMode = \"controller\""));
+    }
+
+    #[test]
+    fn phone_html_renders_share_action_and_read_only_mode() {
+        let html = super::remote_control_html(
+            "viewer-token",
+            RemoteControlAccess::Viewer,
+            "http://127.0.0.1:1?token=viewer-token",
+        );
+        assert!(html.contains("const accessMode = \"viewer\""));
+        assert!(html.contains("id=\"share\""));
+        assert!(html.contains("Read-only share view"));
+        assert!(html.contains("form.hidden = true"));
+        assert!(html.contains("if (!canControl) return"));
     }
 
     #[tokio::test]
@@ -1007,11 +1174,11 @@ mod tests {
             },
         )
         .expect("server should start");
-        let url = url::Url::parse(server.url()).expect("server URL should parse");
+        let url = url::Url::parse(server.share_url()).expect("share URL should parse");
         let token = url
             .query_pairs()
             .find_map(|(name, value)| (name == "token").then(|| value.into_owned()))
-            .expect("server URL should include token");
+            .expect("share URL should include token");
         let addr: SocketAddr = format!(
             "127.0.0.1:{}",
             url.port().expect("server URL should include port")
@@ -1031,6 +1198,10 @@ mod tests {
         let body = response_body(&response);
         let value: serde_json::Value = serde_json::from_str(body).expect("fork response JSON");
         let command = value["command"].as_str().expect("command string");
+        assert!(
+            command.contains(&format!("token={token}")),
+            "fork command should use the read-only share token: {command}"
+        );
         let claim_url = command
             .strip_prefix("codex remote-fork ")
             .expect("remote fork command should include claim URL");
@@ -1131,6 +1302,21 @@ mod tests {
         response
     }
 
+    fn socket_addr_from_url(url: &url::Url) -> SocketAddr {
+        format!(
+            "127.0.0.1:{}",
+            url.port().expect("server URL should include port")
+        )
+        .parse()
+        .expect("socket addr")
+    }
+
+    fn token_from_url(url: &url::Url) -> String {
+        url.query_pairs()
+            .find_map(|(name, value)| (name == "token").then(|| value.into_owned()))
+            .expect("URL should include token")
+    }
+
     fn read_until_contains(stream: &mut TcpStream, marker: &str) -> String {
         let mut response = String::new();
         let mut buffer = [0u8; 512];
@@ -1170,7 +1356,11 @@ mod tests {
 
     #[test]
     fn phone_html_collapses_tool_and_status_blocks_by_default() {
-        let html = super::remote_control_html("test-token");
+        let html = super::remote_control_html(
+            "test-token",
+            RemoteControlAccess::Controller,
+            "http://127.0.0.1:1?token=share-token",
+        );
         assert!(html.contains("function bubbleForItem(item)"));
         assert!(html.contains("role === \"tool\" || role === \"status\""));
         assert!(html.contains("document.createElement(\"details\")"));

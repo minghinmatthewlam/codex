@@ -59,17 +59,27 @@ impl App {
         };
         let mut lines = vec![
             Line::from(vec!["Remote control ".bold(), "active".green()]),
-            Line::from("Scan the QR code with your phone to continue this Codex session."),
+            Line::from("Scan the QR code with your phone to control this Codex session."),
             Line::from(""),
         ];
         lines.extend(server.qr_lines());
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            "URL: ".dim(),
+            "Controller link: ".dim(),
             server.url().to_string().cyan(),
         ]));
         lines.push(
-            "Anyone with this URL can submit prompts to this local Codex session."
+            "The controller link can submit prompts to this local Codex session."
+                .dim()
+                .into(),
+        );
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            "Share link: ".dim(),
+            server.share_url().to_string().cyan(),
+        ]));
+        lines.push(
+            "The share link is read-only: viewers can watch live and fork, but cannot submit prompts."
                 .dim()
                 .into(),
         );
