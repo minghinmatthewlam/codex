@@ -101,11 +101,29 @@ h1 {
   font-size: 12px;
   font-weight: 700;
 }
+.fork-command .copy-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: stretch;
+}
 .fork-command code {
   display: block;
   color: var(--ink);
   font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
   overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.copy-command {
+  min-width: 0;
+  min-height: 34px;
+  align-self: start;
+  padding: 0 12px;
+  border: 1px solid rgba(47, 111, 99, 0.24);
+  background: var(--accent);
+  color: #fffaf1;
+  font-size: 13px;
 }
 .message {
   margin: 0 0 12px;
@@ -350,10 +368,29 @@ function forkCommandNodes() {
   const label = document.createElement("div");
   label.className = "label";
   label.textContent = "Run on the other laptop";
+  const row = document.createElement("div");
+  row.className = "copy-row";
   const code = document.createElement("code");
   code.textContent = lastForkCommand;
-  wrapper.append(label, code);
+  const copy = document.createElement("button");
+  copy.className = "copy-command";
+  copy.type = "button";
+  copy.textContent = "Copy";
+  copy.addEventListener("click", () => copyForkCommand(copy));
+  row.append(code, copy);
+  wrapper.append(label, row);
   return [wrapper];
+}
+
+async function copyForkCommand(button) {
+  if (!lastForkCommand) return;
+  try {
+    await navigator.clipboard.writeText(lastForkCommand);
+    button.textContent = "Copied";
+    connection.textContent = "Fork command copied";
+  } catch (_) {
+    window.prompt("Copy this fork command", lastForkCommand);
+  }
 }
 
 async function loadState() {

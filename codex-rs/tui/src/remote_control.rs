@@ -1137,6 +1137,19 @@ mod tests {
         assert!(html.contains("if (!canControl) return"));
     }
 
+    #[test]
+    fn phone_html_renders_copyable_fork_command() {
+        let html = super::remote_control_html(
+            "viewer-token",
+            RemoteControlAccess::Viewer,
+            "http://127.0.0.1:1?token=viewer-token",
+        );
+        assert!(html.contains("function copyForkCommand(button)"));
+        assert!(html.contains("navigator.clipboard.writeText(lastForkCommand)"));
+        assert!(html.contains("className = \"copy-command\""));
+        assert!(html.contains("user-select: text"));
+    }
+
     #[tokio::test]
     async fn fork_endpoint_returns_claim_command_and_bundle() {
         let temp = tempfile::TempDir::new().expect("temp dir");
